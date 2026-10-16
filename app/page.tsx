@@ -6,7 +6,10 @@ import type { FormEvent, CSSProperties } from "react";
 import type { User } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/client";
 
+type Tab = "DEMONLIST" | "PLAYERS" | "RECORDS";
+
 type Demon = {
+  id: number;
   name: string;
   creator: string;
   verifier: string;
@@ -16,22 +19,25 @@ type Demon = {
   points: number;
   song: string;
   videoUrl: string;
+  thumbnailUrl: string | null;
 };
 
 type PlayerRecord = {
   id: number;
+  userId: string;
   player: string;
   level: string;
+  levelId: number;
   videoUrl: string;
   approved: boolean;
-};
-
-type Player = {
-  name: string;
   points: number;
 };
 
-type Tab = "DEMONLIST" | "PLAYERS" | "RECORDS";
+type Player = {
+  id: string;
+  name: string;
+  points: number;
+};
 
 type Submission = {
   id: number;
@@ -44,9 +50,47 @@ type Submission = {
   points: number;
 };
 
-const demons: Demon[] = [];
-const initialPlayers: Player[] = [];
-const initialRecords: PlayerRecord[] = [];
+type DbLevel = {
+  id: number;
+  name: string;
+  difficulty: string | null;
+  thumbnail_url: string | null;
+  position: number | null;
+};
+
+type DbRecord = {
+  id: number;
+  user_id: string;
+  level_id: number;
+  submission_id: number;
+  points: number;
+};
+
+type DbProfile = {
+  id: string;
+  username: string;
+};
+
+type DbSubmission = {
+  id: number;
+  user_id: string;
+  level_id: number | null;
+  submitted_name: string;
+  video_url: string | null;
+  status: string;
+};
+
+function normalizeDifficulty(value: string | null | undefined): string {
+  const normalized = (value ?? "Unknown").trim().toLowerCase();
+
+  if (normalized.includes("extreme")) return "Extreme Demon";
+  if (normalized.includes("insane")) return "Insane Demon";
+  if (normalized.includes("hard")) return "Hard Demon";
+  if (normalized.includes("medium")) return "Medium Demon";
+  if (normalized.includes("easy")) return "Easy Demon";
+
+  return value?.trim() || "Unknown";
+}
 
 function isYouTubeUrl(value: string): boolean {
   try {
@@ -84,8 +128,11 @@ export default function Home() {
   const [search, setSearch] = useState("");
   const [difficulty, setDifficulty] = useState("All");
 
-  const [records] = useState<PlayerRecord[]>(initialRecords);
-  const [players] = useState<Player[]>(initialPlayers);
+  const [demons, setDemons] = useState<Demon[]>([]);
+  const [records, setRecords] = useState<PlayerRecord[]>([]);
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [dataLoading, setDataLoading] = useState(true);
+  const [dataError, setDataError] = useState("");
 
   const [recordLevel, setRecordLevel] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
@@ -102,7 +149,157 @@ export default function Home() {
   const [submissionsLoading, setSubmissionsLoading] = useState(false);
   const [submissionsError, setSubmissionsError] = useState("");
 
-  // Mantener actualizada la sesión al iniciar o cerrar sesión.
+  // Cargar niveles, registros aprobados y nombres públicos de jugadores.
+  const loadPublicData = useCallback(async () => {
+    setDataLoading(true);
+    setDataError("");
+
+    try {
+      const [
+        { data: levelRows, error: levelsError },
+        { data: recordRows, error: recordsError },
+        { data: profileRows, error: profilesError },
+        { data: submissionRows, error: submissionsError },
+      ] = await Promise.all([
+        supabase
+          .from("levels")
+          .select("id, name, difficulty, thumbnail_url, position")
+          .order("position", { ascending: true, nullsFirst: false })
+          .order("id", { ascending: true }),
+
+        supabase
+          .from("records")
+          .select("id, user_id, level_id, submission_id, points"),
+
+        supabase
+          .from("public_player_profiles")
+          .select("id, username"),
+
+        supabase
+          .from("level_submissions")
+          .select("id, user_id, level_id, submitted_name, video_url, status")
+          .eq("status", "approved"),
+      ]);
+
+      if (levelsError) throw levelsError;
+      if (recordsError) throw recordsError;
+      if (profilesError) throw profilesError;
+      if (submissionsError) throw submissionsError;
+
+      const levels = (levelRows ?? []) as DbLevel[];
+      const dbRecords = (recordRows ?? []) as DbRecord[];
+      const profiles = (profileRows ?? []) as DbProfile[];
+      const submissions = (submissionRows ?? []) as DbSubmission[];
+
+      const profileMap = new Map(
+        profiles.map((profile) => [profile.id, profile.username])
+      );
+
+      const levelMap = new Map(levels.map((level) => [level.id, level]));
+
+      const submissionMap = new Map(
+        submissions.map((submission) => [submission.id, submission])
+      );
+
+      // Algunos niveles todavía no tienen un récord aprobado.
+      // Para esos niveles se usa 0 como puntaje hasta que se configure
+      // un puntaje para el nivel en la base de datos.
+      const pointsByLevel = new Map<number, number>();
+
+      for (const record of dbRecords) {
+        const previous = pointsByLevel.get(record.level_id) ?? 0;
+        pointsByLevel.set(
+          record.level_id,
+          Math.max(previous, Number(record.points) || 0)
+        );
+      }
+
+      const mappedDemons: Demon[] = levels.map((level) => ({
+        id: level.id,
+        name: level.name,
+        creator: "No especificado",
+        verifier: "No especificado",
+        difficulty: normalizeDifficulty(level.difficulty),
+        color: "#25252d",
+        icon: "◆",
+        points: pointsByLevel.get(level.id) ?? 0,
+        song: "No especificada",
+        videoUrl: "",
+        thumbnailUrl: level.thumbnail_url,
+      }));
+
+      const mappedRecords: PlayerRecord[] = dbRecords.map((record) => {
+        const level = levelMap.get(record.level_id);
+        const submission = submissionMap.get(record.submission_id);
+
+        return {
+          id: record.id,
+          userId: record.user_id,
+          player:
+            profileMap.get(record.user_id) ??
+            `Jugador ${record.user_id.slice(0, 8)}`,
+          level: level?.name ?? "Nivel desconocido",
+          levelId: record.level_id,
+          videoUrl: submission?.video_url ?? "",
+          approved: true,
+          points: Number(record.points) || 0,
+        };
+      });
+
+      // El ranking se construye a partir de los puntos reales de records.
+      // Así también aparecen los jugadores que todavía no tenían
+      // una entrada en una lista local de jugadores.
+      const pointsByPlayer = new Map<string, number>();
+
+      for (const record of mappedRecords) {
+        pointsByPlayer.set(
+          record.userId,
+          (pointsByPlayer.get(record.userId) ?? 0) + record.points
+        );
+      }
+
+      const mappedPlayers: Player[] = Array.from(
+        pointsByPlayer.entries()
+      ).map(([id, points]) => ({
+        id,
+        name:
+          profileMap.get(id) ??
+          `Jugador ${id.slice(0, 8)}`,
+        points,
+      }));
+
+      mappedPlayers.sort(
+        (a, b) => b.points - a.points || a.name.localeCompare(b.name)
+      );
+
+      setDemons(mappedDemons);
+      setRecords(mappedRecords);
+      setPlayers(mappedPlayers);
+
+      setSelectedLevel((current) => {
+        if (current && mappedDemons.some((demon) => demon.name === current)) {
+          return current;
+        }
+
+        return mappedDemons[0]?.name ?? "";
+      });
+    } catch (error) {
+      console.error("Error al cargar la demonlist:", error);
+      setDataError(
+        error instanceof Error
+          ? error.message
+          : "No se pudieron cargar los datos de la demonlist."
+      );
+    } finally {
+      setDataLoading(false);
+    }
+  }, [supabase]);
+
+  useEffect(() => {
+    void loadPublicData();
+  }, [loadPublicData]);
+
+  // Mantener actualizada la sesión.
   useEffect(() => {
     let mounted = true;
 
@@ -138,7 +335,7 @@ export default function Home() {
     };
   }, [supabase]);
 
-  // Cargar el nombre de usuario y comprobar el rol.
+  // Cargar nombre y rol de la cuenta conectada.
   useEffect(() => {
     let mounted = true;
 
@@ -175,7 +372,7 @@ export default function Home() {
     };
   }, [authUser, supabase]);
 
-  // Cargar los envíos y los puntos del usuario conectado.
+  // Historial de solicitudes y puntos del usuario conectado.
   const loadMySubmissions = useCallback(async () => {
     if (!authUser) {
       setMySubmissions([]);
@@ -257,43 +454,29 @@ export default function Home() {
     demons.find((demon) => demon.name === selectedLevel) ?? null;
 
   const filteredDemons = useMemo(() => {
+    const query = search.toLowerCase().trim();
+
     return demons.filter((demon) => {
       const matchesSearch =
-        demon.name.toLowerCase().includes(search.toLowerCase()) ||
-        demon.creator.toLowerCase().includes(search.toLowerCase());
+        demon.name.toLowerCase().includes(query) ||
+        demon.creator.toLowerCase().includes(query);
 
       const matchesDifficulty =
         difficulty === "All" || demon.difficulty === difficulty;
 
       return matchesSearch && matchesDifficulty;
     });
-  }, [search, difficulty]);
+  }, [demons, search, difficulty]);
 
   const levelRecords = useMemo(
     () =>
       selectedDemon
-        ? records.filter((record) => record.level === selectedDemon.name)
+        ? records.filter((record) => record.levelId === selectedDemon.id)
         : [],
     [records, selectedDemon]
   );
 
-  const leaderboard = useMemo(() => {
-    return players
-      .map((player) => {
-        const points = records
-          .filter(
-            (record) =>
-              record.player === player.name && record.approved
-          )
-          .reduce((total, record) => {
-            const level = demons.find((demon) => demon.name === record.level);
-            return total + (level?.points ?? 0);
-          }, 0);
-
-        return { ...player, points };
-      })
-      .sort((a, b) => b.points - a.points);
-  }, [players, records]);
+  const leaderboard = players;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -369,9 +552,7 @@ export default function Home() {
       setRecordLevel("");
       setVideoUrl("");
 
-      if (authUser) {
-        await loadMySubmissions();
-      }
+      await loadMySubmissions();
     } catch (error) {
       console.error("Error inesperado al enviar el récord:", error);
       setFormMessage(
@@ -473,6 +654,20 @@ export default function Home() {
         </p>
       </section>
 
+      {dataError && (
+        <section className="content-panel" role="alert">
+          <strong>No se pudieron cargar los datos de Supabase.</strong>
+          <p>{dataError}</p>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={() => void loadPublicData()}
+          >
+            REINTENTAR
+          </button>
+        </section>
+      )}
+
       {activeTab === "DEMONLIST" && (
         <section className="workspace">
           <aside className="level-picker">
@@ -496,49 +691,75 @@ export default function Home() {
               aria-label="Filtrar por dificultad"
             >
               <option value="All">Todas las dificultades</option>
-              <option value="Extreme">Extreme Demon</option>
-              <option value="Insane">Insane Demon</option>
-              <option value="Hard">Hard Demon</option>
-              <option value="Medium">Medium Demon</option>
-              <option value="Easy">Easy Demon</option>
+              <option value="Extreme Demon">Extreme Demon</option>
+              <option value="Insane Demon">Insane Demon</option>
+              <option value="Hard Demon">Hard Demon</option>
+              <option value="Medium Demon">Medium Demon</option>
+              <option value="Easy Demon">Easy Demon</option>
             </select>
 
             <div className="level-picker-list">
-              {filteredDemons.map((demon) => {
-                const rank =
-                  demons.findIndex((item) => item.name === demon.name) + 1;
+              {dataLoading ? (
+                <div className="empty-state">
+                  <strong>Cargando niveles...</strong>
+                </div>
+              ) : (
+                filteredDemons.map((demon) => {
+                  const rank = demons.findIndex(
+                    (item) => item.id === demon.id
+                  ) + 1;
 
-                return (
-                  <button
-                    key={demon.name}
-                    className={`level-picker-item ${
-                      selectedLevel === demon.name ? "selected" : ""
-                    }`}
-                    onClick={() => setSelectedLevel(demon.name)}
-                  >
-                    <span className="picker-rank">
-                      {String(rank).padStart(2, "0")}
-                    </span>
-                    <span
-                      className="picker-thumbnail"
-                      style={{ "--thumb": demon.color } as CSSProperties}
+                  return (
+                    <button
+                      key={demon.id}
+                      className={`level-picker-item ${
+                        selectedLevel === demon.name ? "selected" : ""
+                      }`}
+                      onClick={() => setSelectedLevel(demon.name)}
                     >
-                      {demon.icon}
-                    </span>
-                    <span className="picker-level-info">
-                      <strong>{demon.name}</strong>
-                      <small>{demon.difficulty.toUpperCase()}</small>
-                    </span>
-                    <span className="picker-arrow">›</span>
-                  </button>
-                );
-              })}
+                      <span className="picker-rank">
+                        {String(rank).padStart(2, "0")}
+                      </span>
 
-              {filteredDemons.length === 0 && (
+                      <span
+                        className="picker-thumbnail"
+                        style={
+                          {
+                            "--thumb": demon.color,
+                            overflow: "hidden",
+                          } as CSSProperties
+                        }
+                      >
+                        {demon.thumbnailUrl ? (
+                          <img
+                            src={demon.thumbnailUrl}
+                            alt={`Miniatura de ${demon.name}`}
+                            style={{
+                              width: "100%",
+                              height: "100%",
+                              objectFit: "cover",
+                            }}
+                          />
+                        ) : (
+                          demon.icon
+                        )}
+                      </span>
+
+                      <span className="picker-level-info">
+                        <strong>{demon.name}</strong>
+                        <small>{demon.difficulty.toUpperCase()}</small>
+                      </span>
+                      <span className="picker-arrow">›</span>
+                    </button>
+                  );
+                })
+              )}
+
+              {!dataLoading && filteredDemons.length === 0 && !dataError && (
                 <div className="empty-state">
                   <strong>Todavía no hay niveles.</strong>
                   <p>
-                    El catálogo se conectará con Supabase en el siguiente paso.
+                    Los niveles aprobados aparecerán acá automáticamente.
                   </p>
                 </div>
               )}
@@ -558,20 +779,31 @@ export default function Home() {
               <>
                 <div
                   className="level-banner"
-                  style={{ "--thumb": selectedDemon.color } as CSSProperties}
+                  style={
+                    {
+                      "--thumb": selectedDemon.color,
+                      backgroundImage: selectedDemon.thumbnailUrl
+                        ? `linear-gradient(rgba(10,10,16,.25), rgba(10,10,16,.8)), url("${selectedDemon.thumbnailUrl}")`
+                        : undefined,
+                      backgroundSize: "cover",
+                      backgroundPosition: "center",
+                    } as CSSProperties
+                  }
                 >
                   <div className="banner-grid" />
                   <div className="banner-rank">
                     RANK #
                     {String(
                       demons.findIndex(
-                        (demon) => demon.name === selectedDemon.name
+                        (demon) => demon.id === selectedDemon.id
                       ) + 1
                     ).padStart(2, "0")}
                   </div>
-                  <div className="banner-symbol">{selectedDemon.icon}</div>
+                  <div className="banner-symbol">
+                    {!selectedDemon.thumbnailUrl && selectedDemon.icon}
+                  </div>
                   <div className="banner-caption">
-                    {selectedDemon.difficulty.toUpperCase()} DEMON
+                    {selectedDemon.difficulty.toUpperCase()}
                   </div>
                 </div>
 
@@ -593,7 +825,7 @@ export default function Home() {
                 <div className="level-info-list">
                   <div className="level-info-row">
                     <span>Dificultad</span>
-                    <strong>{selectedDemon.difficulty} Demon</strong>
+                    <strong>{selectedDemon.difficulty}</strong>
                   </div>
                   <div className="level-info-row">
                     <span>Creador</span>
@@ -642,11 +874,25 @@ export default function Home() {
             ) : (
               <div className="records-empty">
                 <span>◇</span>
-                <strong>No hay ningún nivel seleccionado</strong>
+                <strong>
+                  {dataLoading
+                    ? "Cargando niveles..."
+                    : "No hay ningún nivel seleccionado"}
+                </strong>
                 <p>
-                  La lista está vacía. Los niveles se agregarán desde el panel
-                  de administración.
+                  {dataLoading
+                    ? "Estamos consultando la base de datos."
+                    : "Los niveles se agregan desde el panel de administración."}
                 </p>
+                {!dataLoading && (
+                  <button
+                    type="button"
+                    className="level-video-link"
+                    onClick={() => void loadPublicData()}
+                  >
+                    ACTUALIZAR LISTA ↻
+                  </button>
+                )}
               </div>
             )}
           </section>
@@ -669,21 +915,22 @@ export default function Home() {
                     </span>
                     <div className="level-record-player">
                       <strong>{record.player}</strong>
-                      <small>
-                        {record.approved
-                          ? "RÉCORD APROBADO"
-                          : "PENDIENTE DE REVISIÓN"}
-                      </small>
+                      <small>RÉCORD APROBADO · {record.points} PTS</small>
                     </div>
-                    <a
-                      className="record-percent"
-                      href={record.videoUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      aria-label={`Ver prueba de ${record.player}`}
-                    >
-                      100 % ↗
-                    </a>
+
+                    {record.videoUrl ? (
+                      <a
+                        className="record-percent"
+                        href={record.videoUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        aria-label={`Ver prueba de ${record.player}`}
+                      >
+                        100 % ↗
+                      </a>
+                    ) : (
+                      <span className="record-percent">100 %</span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -691,7 +938,7 @@ export default function Home() {
               <div className="records-empty">
                 <span>◇</span>
                 <strong>Sin récords registrados</strong>
-                <p>Todavía no hay récords en esta lista.</p>
+                <p>Todavía no hay récords aprobados para este nivel.</p>
               </div>
             )}
 
@@ -720,11 +967,11 @@ export default function Home() {
             {leaderboard.map((player, index) => {
               const completions = records.filter(
                 (record) =>
-                  record.player === player.name && record.approved
+                  record.userId === player.id && record.approved
               ).length;
 
               return (
-                <div className="leaderboard-row" key={player.name}>
+                <div className="leaderboard-row" key={player.id}>
                   <span
                     className={`leaderboard-rank ${
                       index < 3 ? "top-rank" : ""
@@ -738,7 +985,9 @@ export default function Home() {
                     </span>
                     <strong>{player.name}</strong>
                   </div>
-                  <span className="leaderboard-completions">{completions}</span>
+                  <span className="leaderboard-completions">
+                    {completions}
+                  </span>
                   <strong className="leaderboard-points">
                     {player.points.toLocaleString("es-AR")}
                     <small> PTS</small>
@@ -748,20 +997,31 @@ export default function Home() {
             })}
           </div>
 
-          {leaderboard.length === 0 && (
+          {!dataLoading && leaderboard.length === 0 && !dataError && (
             <div className="records-empty">
               <span>◇</span>
-              <strong>Todavía no hay jugadores registrados</strong>
+              <strong>Todavía no hay jugadores en el ranking</strong>
               <p>
-                El ranking se conectará con los récords aprobados de Supabase.
+                Los jugadores aparecerán cuando tengan récords aprobados
+                con puntos asignados.
               </p>
             </div>
           )}
 
-          <p className="data-notice">
-            El ranking todavía utiliza datos locales vacíos. La conexión del
-            catálogo y la clasificación global será el siguiente paso.
-          </p>
+          {dataLoading && (
+            <div className="records-empty">
+              <strong>Cargando ranking...</strong>
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="level-video-link"
+            onClick={() => void loadPublicData()}
+            disabled={dataLoading}
+          >
+            ↻ ACTUALIZAR RANKING
+          </button>
         </section>
       )}
 
